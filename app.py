@@ -5,165 +5,212 @@ from datetime import datetime, timedelta
 from dateutil import parser
 import re
 import time
+import os
 
-app = Flask(__name__)
+# --- Make sure Flask finds templates/ no matter how it's launched (Vercel-safe) ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+app = Flask(__name__, template_folder=os.path.join(BASE_DIR, 'templates'))
 
-# Add Vercel-specific configuration
 app.config['TEMPLATES_AUTO_RELOAD'] = False
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(minutes=5)
 
+# ---------- Config ----------
+ARTICLES_PER_PAGE = 20
+CACHE_TTL = 600            # 10 minutes
+REQUEST_TIMEOUT = 8        # seconds per HTTP request
+ARCHIVE_MONTHS_BACK = 3    # only scrape last N months of archives
+
+# ---------- In-memory cache ----------
+_cache = {"data": None, "ts": 0}
+
+
 def parse_date_string(date_str):
     try:
-        # Try parsing with current year
         current_year = datetime.now().year
         date_str = f"{date_str} {current_year}"
-        date = parser.parse(date_str)
-        return date.date() 
-    except:
+        return parser.parse(date_str).date()
+    except Exception:
         try:
-            date = parser.parse(date_str)
-            return date.date() 
-        except:
+            return parser.parse(date_str).date()
+        except Exception:
             return None
 
-def scrape_page(url, target_date, articles):
 
+def scrape_page(url, target_date, articles):
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                      '(KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
-    
     try:
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # get article links
         article_links = soup.find_all('a', href=True)
-        
+
         for link in article_links:
             try:
-                # avoid navigation and footer links
-                if any(skip in link['href'].lower() for skip in ['/login', '/signup', '/about', '/contact', '/privacy', '/terms', '#', 'javascript:', 'mailto:']):
+                href = link['href']
+                if any(skip in href.lower() for skip in [
+                    '/login', '/signup', '/about', '/contact',
+                    '/privacy', '/terms', '#', 'javascript:', 'mailto:'
+                ]):
                     continue
-                    
-                # title of article
+
                 title = link.get_text().strip()
-                if not title or len(title) < 10:  # skip unnecessary text
+                if not title or len(title) < 10:
                     continue
-                
-                # Get the link
-                article_url = link['href']
+
+                article_url = href
                 if not article_url.startswith('http'):
                     article_url = f"https://www.theverge.com{article_url}"
-                
-                #extract date from url
+
                 date = None
                 date_match = re.search(r'/(\d{4})/(\d{1,2})/(\d{1,2})/', article_url)
                 if date_match:
                     try:
-                        year, month, day = map(int, date_match.groups())
-                        date = datetime(year, month, day).date()  # Convert to date object
-                    except:
+                        y, m, d = map(int, date_match.groups())
+                        date = datetime(y, m, d).date()
+                    except Exception:
                         pass
-                
-                # Find the parent container
+
                 parent = link.find_parent(['div', 'article'])
                 if not parent:
                     continue
-                
-                # if no date from URL, look for date in the HTML
+
                 if not date:
-                    # Try to find timestamp attribute first
                     time_elem = parent.find('time')
                     if time_elem and time_elem.get('datetime'):
                         try:
-                            date = parser.parse(time_elem['datetime']).date()  # Convert to date object
-                        except:
+                            date = parser.parse(time_elem['datetime']).date()
+                        except Exception:
                             pass
-                    
-                    # find date in text
-                    if not date:
-                        for elem in parent.find_all(['span', 'div', 'time']):
-                            text = elem.get_text().strip().upper()
-                            if any(month in text for month in ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC']):
-                                date = parse_date_string(elem.get_text().strip())
-                                if date:
-                                    break
-                
-                # proceed if we have a valid date from 2022 onwards
-                if date and date >= target_date.date():  # Convert target_date to date for comparison
-                    
-                    # Check if article is already added (avoid duplicates)
+
+                if not date:
+                    for elem in parent.find_all(['span', 'div', 'time']):
+                        text = elem.get_text().strip().upper()
+                        if any(m in text for m in [
+                            'JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN',
+                            'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'
+                        ]):
+                            date = parse_date_string(elem.get_text().strip())
+                            if date:
+                                break
+
+                if date and date >= target_date.date():
                     if not any(a['link'] == article_url for a in articles):
-                        try:
-                            formatted_date = date
-                            if isinstance(date, datetime):
-                                formatted_date = date.date()
-                            articles.append({
-                                'title': title,
-                                'link': article_url,
-                                'date': formatted_date,
-                            })
-                            print(f"Added article from {formatted_date.strftime('%Y-%m-%d')}: {title}")
-                        except Exception as e:
-                            print(f"Error formatting date for article: {str(e)}")
-                            continue
-            
+                        articles.append({
+                            'title': title,
+                            'link': article_url,
+                            'date': date,
+                        })
             except Exception as e:
-                print(f"Error processing article: {str(e)}")
+                print(f"Error processing article: {e}")
                 continue
     except Exception as e:
-        print(f"Error fetching page {url}: {str(e)}")
+        print(f"Error fetching page {url}: {e}")
+
 
 def scrape_the_verge():
     articles = []
     target_date = datetime(2022, 1, 1)
-    print(f"Fetching articles from {target_date.strftime('%B %d, %Y')} onwards...")
-    
+
     try:
-        # scrape the homepage
-        print("\nScraping homepage...")
         scrape_page("https://www.theverge.com", target_date, articles)
-        
-        # scrape archive pages from 2022
+
         current_date = datetime.now()
-        archive_date = target_date
-        
+        first_month = (current_date.replace(day=1)
+                       - timedelta(days=30 * (ARCHIVE_MONTHS_BACK - 1))).replace(day=1)
+
+        archive_date = first_month
         while archive_date <= current_date:
-            archive_url = f"https://www.theverge.com/archives/{archive_date.year}/{archive_date.month}"
-            print(f"\nScraping archive for {archive_date.strftime('%B %Y')}...")
+            archive_url = (f"https://www.theverge.com/archives/"
+                           f"{archive_date.year}/{archive_date.month}")
             scrape_page(archive_url, target_date, articles)
-            
-            # subsequent months
+
             if archive_date.month == 12:
                 archive_date = datetime(archive_date.year + 1, 1, 1)
             else:
                 archive_date = datetime(archive_date.year, archive_date.month + 1, 1)
-        
-        # Sort articles by date in descending order (newest first)
-        articles.sort(key=lambda x: x['date'] if x['date'] else datetime.min.date(), reverse=True)
-        
-        # Print debug information
-        print(f"\nFound {len(articles)} articles from {target_date.strftime('%B %d, %Y')} onwards")
-        if len(articles) == 0:
-            print("No articles found.")
-        else:
-            print("\nFirst 5 articles after sorting:")
-            for i, article in enumerate(articles[:5]):
-                print(f"{i+1}. {article['date'].strftime('%Y-%m-%d')} - {article['title']}")
+
+        articles.sort(
+            key=lambda x: x['date'] if x['date'] else datetime.min.date(),
+            reverse=True
+        )
+        print(f"Scraped {len(articles)} articles")
         return articles
-        
     except Exception as e:
-        print(f"Error fetching The Verge website: {str(e)}")
+        print(f"Error fetching The Verge: {e}")
         return []
+
+
+def get_articles_cached():
+    now = time.time()
+    if _cache["data"] is None or (now - _cache["ts"]) > CACHE_TTL:
+        _cache["data"] = scrape_the_verge()
+        _cache["ts"] = now
+    return _cache["data"]
+
+
+# ---------- Routes ----------
 
 @app.route('/')
 def index():
     try:
-        print("Starting to fetch articles...")
-        articles = scrape_the_verge()
-        print(f"Rendering template with {len(articles)} articles")
-        return render_template('index.html', articles=articles)
-    except Exception as e:
-        print(f"Error in index route: {str(e)}")
-        return render_template('index.html', articles=[], error=str(e)) 
+        page = max(1, int(request.args.get('page', 1)))
+    except (ValueError, TypeError):
+        page = 1
+
+    articles = get_articles_cached()
+    total = len(articles)
+    total_pages = max(1, (total + ARTICLES_PER_PAGE - 1) // ARTICLES_PER_PAGE)
+
+    if page > total_pages:
+        page = total_pages
+
+    start = (page - 1) * ARTICLES_PER_PAGE
+    page_articles = articles[start:start + ARTICLES_PER_PAGE]
+
+    return render_template(
+        'index.html',
+        articles=page_articles,
+        page=page,
+        total_pages=total_pages,
+        total_articles=total,
+        per_page=ARTICLES_PER_PAGE,
+    )
+
+
+@app.route('/api/articles')
+def api_articles():
+    try:
+        page = max(1, int(request.args.get('page', 1)))
+        per_page = min(100, max(1, int(request.args.get('per_page', ARTICLES_PER_PAGE))))
+    except (ValueError, TypeError):
+        page, per_page = 1, ARTICLES_PER_PAGE
+
+    articles = get_articles_cached()
+    total = len(articles)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = min(page, total_pages)
+
+    start = (page - 1) * per_page
+    page_articles = articles[start:start + per_page]
+
+    return jsonify({
+        'page': page,
+        'per_page': per_page,
+        'total': total,
+        'total_pages': total_pages,
+        'articles': [
+            {
+                'title': a['title'],
+                'link': a['link'],
+                'date': a['date'].strftime('%Y-%m-%d'),
+            }
+            for a in page_articles
+        ],
+    })
+
+
+if __name__ == '__main__':
+    app.run(debug=True)
